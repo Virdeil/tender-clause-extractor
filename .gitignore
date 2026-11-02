@@ -1,0 +1,15 @@
+# 运行时生成的输出文件
+*.xlsx
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 密钥与环境变量（绝对不能提交）
+.env
+key.txt
+*.key
+
+# 系统文件
+Thumbs.db
+desktop.ini
