@@ -44,6 +44,11 @@ def main():
     print(f"载入 {len(cases)} 道题、{len(chunks)} 个句子块、{len(pages)} 页")
     print("构建 BM25...")
     bm25 = rag_core.build(chunks)
+
+    # 页码映射：eval_set 记的是 PDF 页码，回答里引的是印刷页码
+    page_to_printed = {}
+    for _c in chunks:
+        page_to_printed[_c["page"]] = _c.get("printed", _c["page"])
     print("开始评测（每题约 5-15 秒）\n")
 
     rows = []
@@ -72,7 +77,7 @@ def main():
                 trap_ok += 1
         else:
             ok_ans = any(k in text for k in c["kw"]) if c["kw"] else None
-            ok_page = (c["page"] in pages_in_answer) if pages_in_answer else False
+            ok_page = (page_to_printed.get(c["page"], c["page"]) in pages_in_answer) if pages_in_answer else False
             if ok_ans:
                 ans_hit += 1
             if ok_page:
