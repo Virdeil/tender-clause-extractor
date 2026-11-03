@@ -123,14 +123,15 @@ def ocr_pdf(file_bytes, progress=None, max_pages=MAX_OCR_PAGES):
     return out
 
 
-def build_index(pages):
+def build_index(pages, offset=0):
     """页 → 句子块（供检索）＋ 整页（供生成）"""
     sentences, page_map = [], {}
 
     for pno, body in pages:
-        page_map[f"upload|{pno}"] = {"file": "upload", "page": pno, "text": body}
+        printed = pno + offset
+        page_map[f"upload|{pno}"] = {"file": "upload", "page": pno, "printed": printed, "text": body}
         for s in rag_core.split_sentences(body):
-            sentences.append({"file": "upload", "page": pno, "text": s})
+            sentences.append({"file": "upload", "page": pno, "printed": printed, "text": s})
 
     return sentences, page_map
 
@@ -191,7 +192,12 @@ def prepare(file_bytes, filename):
     if not pages:
         return None, None, None, 0, 0, 0.0, method
 
-    sentences, page_map = build_index(pages)
+    # 测页码偏移（页脚是图片，只能视觉读）；失败则按 0 处理
+    offset = 0
+    if filename.lower().endswith(".pdf") and len(pages) > 5:
+        offset = rag_core.detect_page_offset(file_bytes)
+
+    sentences, page_map = build_index(pages, offset)
     if not sentences:
         return None, None, None, len(pages), n_chars, 0.0, method
 
