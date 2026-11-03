@@ -19,6 +19,8 @@ import time
 
 import requests
 
+import rag_core
+
 
 # ==================== 配置 ====================
 
@@ -30,6 +32,9 @@ EMBED_URL = "https://api.siliconflow.cn/v1/embeddings"
 EMBED_MODEL = "BAAI/bge-m3"
 
 SRC_DIR = r"C:\Users\admin\Desktop\招标文件分章节"
+# 原始 PDF：用来测「印刷页码 - PDF 页码」的偏移。
+# 本项目这份 PDF 的页脚是图片，文本层抽不到，只能靠视觉模型读。
+SRC_PDF = r"C:\Users\admin\Downloads\fbdee8c9f7164881a7a348f8d3d9a590.pdf"
 OUT_INDEX = "index.json"
 OUT_PAGES = "pages.json"
 
@@ -67,7 +72,7 @@ def split_sentences(text, max_len=SENT_MAX):
     return [x for x in out if len(x) >= SENT_MIN]
 
 
-def build(src_dir):
+def build(src_dir, offset=0):
     """返回 (句子块列表, 整页字典)"""
     sentences, pages = [], {}
 
@@ -86,9 +91,12 @@ def build(src_dir):
             body = "".join(x.strip() for x in buf).strip()
             if not body:
                 return
-            pages[f"{fn}|{page}"] = {"file": fn, "page": page, "text": body}
+            printed = page + offset
+            pages[f"{fn}|{page}"] = {"file": fn, "page": page,
+                                     "printed": printed, "text": body}
             for s in split_sentences(body):
-                sentences.append({"file": fn, "page": page, "text": s})
+                sentences.append({"file": fn, "page": page,
+                                  "printed": printed, "text": s})
 
         for ln in lines:
             s = ln.strip()
@@ -135,8 +143,16 @@ def embed(texts):
 # ==================== 主流程 ====================
 
 def main():
-    print("1) 切分（句子级 + 整页）...")
-    sentences, pages = build(SRC_DIR)
+    offset = 0
+    if os.path.exists(SRC_PDF):
+        print("0) 测量页码偏移（视觉读页脚）...")
+        offset = rag_core.detect_page_offset(open(SRC_PDF, "rb").read())
+        print(f"   印刷页码 = PDF 页码 {offset:+d}")
+    else:
+        print("0) 未找到原始 PDF，页码偏移按 0 处理")
+
+    print("\n1) 切分（句子级 + 整页）...")
+    sentences, pages = build(SRC_DIR, offset)
     print(f"   句子块 {len(sentences)} 个 ｜ 整页 {len(pages)} 页")
     lens = [len(s["text"]) for s in sentences]
     print(f"   句子长度：最短 {min(lens)}，最长 {max(lens)}，平均 {sum(lens)//len(lens)}")
