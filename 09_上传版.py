@@ -24,6 +24,17 @@ st.set_page_config(page_title="招标文件智能问答", page_icon="📄", layo
 
 MAX_PAGES_WARN = 200      # 超过这个页数提示会慢
 MIN_SENTENCES = 20        # 少于这个句子数，认为提取不完整
+MIN_TEXT_CHARS = 100      # 全文少于这么多字，判为扫描件，回退到视觉 OCR
+MAX_OCR_PAGES = 40        # 视觉 OCR 最多处理多少页（按页计费，防止烧钱）
+
+VLM_URL = "https://api.siliconflow.cn/v1/chat/completions"
+VLM_MODEL = "Qwen/Qwen3-VL-32B-Instruct"
+
+OCR_PROMPT = (
+    "请逐字转录这一页的全部文字。\n"
+    "如果是表格，请按「条目：内容」逐行输出，保留数字、单位、百分比和勾选项。\n"
+    "不要总结，不要解释，不要添加原文没有的内容。"
+)
 
 
 # ==================== 从上传文件解析出「页」====================
@@ -58,6 +69,58 @@ def parse_pages(file_bytes, filename):
         return [(1, body)] if body else []
 
     return []
+
+
+def ocr_page(image_bytes):
+    """用视觉模型把一页图片转录成文字（扫描件的兜底方案）。"""
+    import base64
+    import requests
+
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = requests.post(
+        VLM_URL,
+        headers={"Authorization": f"Bearer {os.environ.get('SF_API_KEY', '')}",
+                 "Content-Type": "application/json"},
+        json={
+            "model": VLM_MODEL,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": OCR_PROMPT},
+            ]}],
+        },
+        timeout=180,
+    )
+    if resp.status_code != 200:
+        return ""
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def ocr_pdf(file_bytes, progress=None, max_pages=MAX_OCR_PAGES):
+    """把扫描件 PDF 逐页渲染成图片，再逐页转录成文字。
+
+    返回 [(页码, 正文), ...] —— 结构和 parse_pages 一致，
+    所以下游的切分、向量、检索、页码引用全都不用改。
+    """
+    import fitz
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    n = min(len(doc), max_pages)
+    out = []
+
+    for i in range(n):
+        pix = doc[i].get_pixmap(dpi=150)
+        img = pix.tobytes("jpeg", jpg_quality=85)
+        text = ocr_page(img)
+        body = clean_text(text)
+        if body:
+            out.append((i + 1, body))
+        if progress:
+            progress((i + 1) / n, f"视觉识别第 {i + 1}/{n} 页")
+
+    doc.close()
+    return out
 
 
 def build_index(pages):
@@ -106,20 +169,31 @@ if up is None:
 
 @st.cache_resource(show_spinner=False)
 def prepare(file_bytes, filename):
-    """返回 (sentences, page_map, bm25, n_pages, n_chars, cost)。
+    """返回 (sentences, page_map, bm25, n_pages, n_chars, cost, method)。
+
+    method: "text"（直接提取）或 "vision"（扫描件，用视觉模型 OCR）
     提取失败时 sentences 为 None，不浪费一次向量化调用。
     """
     t0 = time.time()
 
     pages = parse_pages(file_bytes, filename)
-    if not pages:
-        return None, None, None, 0, 0, 0.0
-
     n_chars = sum(len(b) for _, b in pages)
+
+    # 文字太少 → 判为扫描件 → 回退到视觉 OCR
+    method = "text"
+    if n_chars < MIN_TEXT_CHARS and filename.lower().endswith(".pdf"):
+        method = "vision"
+        bar = st.progress(0.0, text="扫描件：启动视觉识别...")
+        pages = ocr_pdf(file_bytes, progress=lambda r, t: bar.progress(min(r, 1.0), text=t))
+        bar.empty()
+        n_chars = sum(len(b) for _, b in pages)
+
+    if not pages:
+        return None, None, None, 0, 0, 0.0, method
 
     sentences, page_map = build_index(pages)
     if not sentences:
-        return None, None, None, len(pages), n_chars, 0.0
+        return None, None, None, len(pages), n_chars, 0.0, method
 
     bar = st.progress(0.0, text="计算向量...")
     BATCH = 16
@@ -132,22 +206,23 @@ def prepare(file_bytes, filename):
     bar.empty()
 
     bm25 = rag_core.build(sentences)
-    return sentences, page_map, bm25, len(pages), n_chars, time.time() - t0
+    return sentences, page_map, bm25, len(pages), n_chars, time.time() - t0, method
 
 
 with st.spinner("解析文件..."):
-    sentences, page_map, bm25, n_pages, n_chars, cost = prepare(up.getvalue(), up.name)
+    sentences, page_map, bm25, n_pages, n_chars, cost, method = prepare(up.getvalue(), up.name)
 
 
 # ==================== 提取结果自检（产品细节）====================
 
 if n_pages == 0:
-    st.error("**这个文件提取不到任何文字。**")
+    st.error("**这个文件读不出任何内容。**")
     st.markdown(
-        "常见原因：\n\n"
-        "- 这是**扫描件**（整页是图片）——需要先做 OCR 识别成文字\n"
-        "- PDF 用了特殊编码或加密\n\n"
-        "建议：用 WPS / Adobe 打开看一眼，如果文字能选中复制，就不是扫描件。"
+        "已经试过两条路：\n\n"
+        "- **文本提取**：结果为空\n"
+        "- **视觉识别**（Qwen3-VL）：也没识别出文字\n\n"
+        "常见原因：PDF 加密、图片分辨率过低、或根本不是文档。\n"
+        "建议：用 WPS / Adobe 打开看一眼能不能正常显示。"
     )
     st.stop()
 
@@ -164,9 +239,13 @@ if len(sentences) < MIN_SENTENCES:
         f"内容偏少或提取不完整，问答效果可能不佳。"
     )
 
+if method == "vision":
+    st.info(f"🖼 这是一份**扫描件**（文本提取不到内容），已用视觉模型逐页识别。"
+            f"识别页数上限 {MAX_OCR_PAGES} 页。")
+
 st.success(
     f"已建索引：**{n_pages}** 页 · **{n_chars:,}** 字 → **{len(sentences)}** 个句子块，"
-    f"耗时 **{cost:.1f}** 秒"
+    f"耗时 **{cost:.1f}** 秒" + ("（视觉识别）" if method == "vision" else "")
 )
 
 
