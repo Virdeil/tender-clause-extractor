@@ -39,6 +39,11 @@ def main():
 
     print(f"载入 {len(cases)} 题 / {len(chunks)} 句 / {len(pages)} 页")
     bm25 = rag_core.build(chunks)
+
+    # 页码映射：eval_set 记的是 PDF 页码，回答里引的是印刷页码
+    page_to_printed = {}
+    for _c in chunks:
+        page_to_printed[_c["page"]] = _c.get("printed", _c["page"])
     print("开始评测（每题 3-10 秒）\n")
 
     rows = []
