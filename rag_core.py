@@ -217,6 +217,92 @@ def expand_to_pages(hits, pages, max_pages=3):
     return out
 
 
+# ==================== 页码映射 ====================
+
+def detect_printed_page(text, pdf_page, tolerance=5):
+    """从页尾猜「文档自己印的页码」。
+
+    为什么需要：PDF 第 8 页，页脚印的可能是「6」。
+    系统引用「第 8 页」时，客户翻到第 8 页看到的是别的内容。
+
+    校验：印刷页码必须离 PDF 页码不远（默认 ±5），
+    否则当作噪声丢弃——页尾的数字也可能是金额、日期、编号。
+    """
+    tail = text[-40:]
+    m = re.search(r"(\d{1,4})\D{0,4}$", tail)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if 1 <= n <= 9999 and abs(n - pdf_page) <= tolerance:
+        return n
+    return None
+
+
+def detect_page_offset(pdf_bytes, sample_indexes=(2, 20, 40), dpi=200,
+                       strip_ratio=0.09, tolerance=10):
+    """测出「印刷页码 - PDF 页码」的偏移量。
+
+    为什么不能用文本提取：本项目这份 PDF 的页脚页码是**图片**，
+    pypdf / pymupdf 都抽不到。所以裁出页脚那一条，让视觉模型读它是几。
+
+    返回出现次数最多的偏移量；测不出就返回 0。
+    """
+    import base64
+    import fitz
+    import requests
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n = len(doc)
+    cands = [i + 1 for i in sample_indexes if i < n]
+    if not cands:
+        doc.close()
+        return 0
+
+    offsets = []
+    for pno in cands:
+        page = doc[pno - 1]
+        r = page.rect
+        clip = fitz.Rect(r.x0, r.y1 - r.height * strip_ratio, r.x1, r.y1)
+        img = page.get_pixmap(dpi=dpi, clip=clip).tobytes("png")
+
+        resp = requests.post(
+            "https://api.siliconflow.cn/v1/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+            json={"model": "Qwen/Qwen3-VL-32B-Instruct", "temperature": 0,
+                  "messages": [{"role": "user", "content": [
+                      {"type": "image_url",
+                       "image_url": {"url": "data:image/png;base64," + base64.b64encode(img).decode()}},
+                      {"type": "text", "text": "这是页脚。只回答你看到的页码数字，看不到就回答 无。"},
+                  ]}]},
+            timeout=120,
+        )
+        doc.close() if False else None
+        if resp.status_code != 200:
+            continue
+        ans = resp.json()["choices"][0]["message"]["content"]
+        m = re.search(r"(\d{1,4})", ans)
+        if not m:
+            continue
+        num = int(m.group(1))
+        if abs(num - pno) <= tolerance:
+            offsets.append(num - pno)
+
+    doc.close()
+    if not offsets:
+        return 0
+    from collections import Counter
+    return Counter(offsets).most_common(1)[0][0]
+
+
+def page_label(chunk):
+    """生成给模型看的页码标签。"""
+    printed = chunk.get("printed")
+    pdf_page = chunk.get("page")
+    if printed and printed != pdf_page:
+        return f"第 {printed} 页（PDF 第 {pdf_page} 页）"
+    return f"第 {printed or pdf_page} 页"
+
+
 # ==================== 生成 ====================
 
 SYSTEM_PROMPT = """你是招投标文件助手。只依据用户提供的【资料】回答问题。
@@ -247,7 +333,7 @@ def build_context(hits):
     """把检索结果拼成带页码的资料块。页码在这里被显式写进提示词。"""
     parts = []
     for i, (c, _score) in enumerate(hits, 1):
-        parts.append(f"【资料{i}｜第 {c['page']} 页】\n{c['text']}")
+        parts.append(f"【资料{i}｜{page_label(c)}】\n{c['text']}")
     return "\n\n".join(parts)
 
 
